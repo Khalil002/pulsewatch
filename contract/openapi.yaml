@@ -1,0 +1,589 @@
+openapi: 3.0.3
+info:
+  title: pulsewatch API
+  version: 1.0.0
+  description: |
+    Self-hostable uptime monitoring with public status pages. Every backend
+    (Spring Boot, Express, ASP.NET Core) implements this contract on the same
+    PostgreSQL schema and the same Redis keys.
+
+    **Tenancy.** Every account belongs to one organisation. Monitors, checks,
+    incidents, alerts and API keys are scoped to it, and PostgreSQL row-level
+    security enforces that scope: another org's resources answer 404.
+
+    **Roles.** `owner` (one per org, manages members), `admin` (manages
+    monitors and API keys), `viewer` (read only).
+
+    **Auth.** Either `Authorization: Bearer <JWT>` from `/auth/login`, or
+    `X-API-Key: pw_...` from `/api-keys`. An API key acts as an admin of its org,
+    cannot manage API keys or members, and is rate limited per key.
+
+    **Checks.** A scheduler in every replica claims due monitors with
+    `FOR UPDATE SKIP LOCKED`, so each check runs once however many replicas
+    there are. Redirects are not followed. A check passes when the response
+    status equals `expectedStatus`. Failure causes read
+    `expected 200 but got 503`, `timeout after 1000 ms` or
+    `connection failed: <reason>`.
+
+    **Alerts.** When a monitor goes down (an incident opens) or comes back up
+    (it resolves), a job is queued in the same transaction. Workers POST the
+    payload to `alertWebhookUrl` with `X-Pulsewatch-Event` and
+    `X-Pulsewatch-Signature: sha256=<hex HMAC-SHA256 of the raw body keyed by
+    the org's webhookSecret>`. A failed delivery is retried after 2^attempts
+    seconds, up to 5 attempts, then marked `dead`.
+
+    Errors use RFC 7807 problem details with an extra machine-readable `code`.
+servers:
+  - url: http://localhost:8080/api
+security:
+  - bearerAuth: []
+  - apiKey: []
+
+paths:
+  /health:
+    get:
+      summary: Liveness and dependency check
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  backend: { type: string, enum: [spring, express, dotnet] }
+
+  /auth/register:
+    post:
+      summary: Create an organisation and its owner account
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Registration" }
+      responses:
+        "201": { $ref: "#/components/responses/Auth" }
+        "400": { $ref: "#/components/responses/Problem" }
+        "409": { $ref: "#/components/responses/Problem" }
+
+  /auth/login:
+    post:
+      summary: Exchange credentials for a JWT
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string }
+                password: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Auth" }
+        "401": { $ref: "#/components/responses/Problem" }
+
+  /me:
+    get:
+      summary: The calling user (JWT only; an API key has no user)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "401": { $ref: "#/components/responses/Problem" }
+        "403": { $ref: "#/components/responses/Problem" }
+
+  /org:
+    get:
+      summary: The caller's organisation (webhookSecret only for owner and admin)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Org" }
+
+  /members:
+    get:
+      summary: Members of the organisation
+      responses:
+        "200":
+          description: Oldest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Member" }
+    post:
+      summary: Add a member (owner only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NewMember" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Member" }
+        "400": { $ref: "#/components/responses/Problem" }
+        "403": { $ref: "#/components/responses/Problem" }
+        "409": { $ref: "#/components/responses/Problem" }
+
+  /api-keys:
+    get:
+      summary: API keys of the organisation (owner or admin, JWT only)
+      responses:
+        "200":
+          description: Newest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ApiKey" }
+        "403": { $ref: "#/components/responses/Problem" }
+    post:
+      summary: Create an API key (owner or admin, JWT only). The key is returned once.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 60 }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/ApiKey" }
+                  - type: object
+                    required: [key]
+                    properties:
+                      key: { type: string, example: pw_3f9a0c... }
+        "400": { $ref: "#/components/responses/Problem" }
+        "403": { $ref: "#/components/responses/Problem" }
+
+  /api-keys/{keyId}:
+    parameters:
+      - { in: path, name: keyId, required: true, schema: { type: string, format: uuid } }
+    delete:
+      summary: Revoke an API key (owner or admin, JWT only)
+      responses:
+        "204": { description: Revoked }
+        "403": { $ref: "#/components/responses/Problem" }
+        "404": { $ref: "#/components/responses/Problem" }
+
+  /monitors:
+    get:
+      summary: Monitors of the organisation, newest first
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Monitor" }
+    post:
+      summary: Create a monitor (owner or admin). Its first check runs right away.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NewMonitor" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Monitor" }
+        "400": { $ref: "#/components/responses/Problem" }
+        "403": { $ref: "#/components/responses/Problem" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /monitors/{monitorId}:
+    parameters:
+      - $ref: "#/components/parameters/MonitorId"
+    get:
+      summary: One monitor
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Monitor" }
+        "404": { $ref: "#/components/responses/Problem" }
+    patch:
+      summary: Change any fields (owner or admin). The next check runs right away.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MonitorPatch" }
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Monitor" }
+        "400": { $ref: "#/components/responses/Problem" }
+        "403": { $ref: "#/components/responses/Problem" }
+        "404": { $ref: "#/components/responses/Problem" }
+    delete:
+      summary: Delete a monitor and its history (owner or admin)
+      responses:
+        "204": { description: Deleted }
+        "403": { $ref: "#/components/responses/Problem" }
+        "404": { $ref: "#/components/responses/Problem" }
+
+  /monitors/{monitorId}/check:
+    parameters:
+      - $ref: "#/components/parameters/MonitorId"
+    post:
+      summary: Run a check as soon as possible (owner or admin)
+      responses:
+        "202":
+          description: Queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  queued: { type: boolean, enum: [true] }
+        "403": { $ref: "#/components/responses/Problem" }
+        "404": { $ref: "#/components/responses/Problem" }
+
+  /monitors/{monitorId}/checks:
+    parameters:
+      - $ref: "#/components/parameters/MonitorId"
+      - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 500, default: 50 } }
+    get:
+      summary: Recent check results, newest first
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/CheckResult" }
+        "404": { $ref: "#/components/responses/Problem" }
+
+  /monitors/{monitorId}/stats:
+    parameters:
+      - $ref: "#/components/parameters/MonitorId"
+    get:
+      summary: Uptime and latency over the last 24 hours
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MonitorStats" }
+        "404": { $ref: "#/components/responses/Problem" }
+
+  /incidents:
+    get:
+      summary: Incidents of the organisation, newest first (up to 100)
+      parameters:
+        - { in: query, name: status, schema: { type: string, enum: [open, resolved] } }
+        - { in: query, name: monitorId, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Incident" }
+
+  /alerts:
+    get:
+      summary: Alert deliveries, newest first (up to 100)
+      parameters:
+        - { in: query, name: monitorId, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/AlertDelivery" }
+
+  /status/{slug}:
+    parameters:
+      - { in: path, name: slug, required: true, schema: { type: string } }
+    get:
+      summary: Public status page (no auth; cached in Redis for a few seconds)
+      security: []
+      responses:
+        "200":
+          description: OK
+          headers:
+            X-Cache: { schema: { type: string, enum: [HIT, MISS] } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatusPage" }
+        "404": { $ref: "#/components/responses/Problem" }
+
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer, bearerFormat: JWT }
+    apiKey: { type: apiKey, in: header, name: X-API-Key }
+
+  parameters:
+    MonitorId:
+      in: path
+      name: monitorId
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    Auth:
+      description: Token and user
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [token, user]
+            properties:
+              token: { type: string }
+              user: { $ref: "#/components/schemas/User" }
+    Problem:
+      description: Error
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    RateLimited:
+      description: Too many requests for this API key
+      headers:
+        Retry-After: { schema: { type: integer } }
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+
+  schemas:
+    Registration:
+      type: object
+      required: [email, password, orgName]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, minLength: 8, maxLength: 72 }
+        orgName: { type: string, minLength: 2, maxLength: 60 }
+
+    Role:
+      type: string
+      enum: [owner, admin, viewer]
+
+    User:
+      type: object
+      required: [id, email, role, orgId]
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string }
+        role: { $ref: "#/components/schemas/Role" }
+        orgId: { type: string, format: uuid }
+
+    Org:
+      type: object
+      required: [id, name, slug, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        slug: { type: string, example: acme-k3f9, description: "slugified name plus 4 random characters" }
+        createdAt: { type: string, format: date-time }
+        webhookSecret: { type: string, description: Omitted for viewers }
+
+    Member:
+      type: object
+      required: [id, email, role, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string }
+        role: { $ref: "#/components/schemas/Role" }
+        createdAt: { type: string, format: date-time }
+
+    NewMember:
+      type: object
+      required: [email, password, role]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, minLength: 8, maxLength: 72 }
+        role: { type: string, enum: [admin, viewer] }
+
+    ApiKey:
+      type: object
+      required: [id, name, prefix, createdAt, lastUsedAt, revokedAt]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        prefix: { type: string, description: First 10 characters of the key }
+        createdAt: { type: string, format: date-time }
+        lastUsedAt: { type: string, format: date-time, nullable: true }
+        revokedAt: { type: string, format: date-time, nullable: true }
+
+    NewMonitor:
+      type: object
+      required: [name, url]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        url: { type: string, maxLength: 2048, description: "http:// or https://" }
+        method: { type: string, enum: [GET, HEAD], default: GET }
+        intervalSec: { type: integer, minimum: 10, maximum: 3600, default: 60 }
+        timeoutMs: { type: integer, minimum: 500, maximum: 10000, default: 5000 }
+        expectedStatus: { type: integer, minimum: 100, maximum: 599, default: 200 }
+        alertWebhookUrl: { type: string, nullable: true, maxLength: 2048 }
+        paused: { type: boolean, default: false }
+
+    MonitorPatch:
+      type: object
+      description: Same fields as NewMonitor, all optional; at least one is required
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        url: { type: string, maxLength: 2048 }
+        method: { type: string, enum: [GET, HEAD] }
+        intervalSec: { type: integer, minimum: 10, maximum: 3600 }
+        timeoutMs: { type: integer, minimum: 500, maximum: 10000 }
+        expectedStatus: { type: integer, minimum: 100, maximum: 599 }
+        alertWebhookUrl: { type: string, nullable: true, maxLength: 2048 }
+        paused: { type: boolean }
+
+    Monitor:
+      type: object
+      required: [id, name, url, method, intervalSec, timeoutMs, expectedStatus, alertWebhookUrl, paused, status, lastCheckedAt, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        url: { type: string }
+        method: { type: string, enum: [GET, HEAD] }
+        intervalSec: { type: integer }
+        timeoutMs: { type: integer }
+        expectedStatus: { type: integer }
+        alertWebhookUrl: { type: string, nullable: true }
+        paused: { type: boolean }
+        status: { type: string, enum: [pending, up, down], description: Result of the latest check }
+        lastCheckedAt: { type: string, format: date-time, nullable: true }
+        createdAt: { type: string, format: date-time }
+
+    CheckResult:
+      type: object
+      required: [checkedAt, ok, statusCode, latencyMs, error]
+      properties:
+        checkedAt: { type: string, format: date-time }
+        ok: { type: boolean }
+        statusCode: { type: integer, nullable: true }
+        latencyMs: { type: integer }
+        error: { type: string, nullable: true }
+
+    MonitorStats:
+      type: object
+      required: [checks, failures, uptimePercent, avgLatencyMs, p95LatencyMs, hourly]
+      properties:
+        checks: { type: integer }
+        failures: { type: integer }
+        uptimePercent: { type: number, nullable: true, description: "2 decimals; null with no checks" }
+        avgLatencyMs: { type: integer, nullable: true }
+        p95LatencyMs: { type: integer, nullable: true }
+        hourly:
+          type: array
+          description: One entry per hour that has checks, oldest first
+          items:
+            type: object
+            required: [hour, checks, failures, avgLatencyMs]
+            properties:
+              hour: { type: string, format: date-time }
+              checks: { type: integer }
+              failures: { type: integer }
+              avgLatencyMs: { type: integer }
+
+    Incident:
+      type: object
+      required: [id, monitorId, monitorName, startedAt, resolvedAt, cause]
+      properties:
+        id: { type: string, format: uuid }
+        monitorId: { type: string, format: uuid }
+        monitorName: { type: string }
+        startedAt: { type: string, format: date-time }
+        resolvedAt: { type: string, format: date-time, nullable: true }
+        cause: { type: string }
+
+    AlertDelivery:
+      type: object
+      required: [id, monitorId, event, status, attempts, lastError, createdAt, sentAt]
+      properties:
+        id: { type: string, format: uuid }
+        monitorId: { type: string, format: uuid }
+        event: { type: string, enum: [monitor.down, monitor.up] }
+        status: { type: string, enum: [pending, sent, dead] }
+        attempts: { type: integer }
+        lastError: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+        sentAt: { type: string, format: date-time, nullable: true }
+
+    AlertPayload:
+      type: object
+      description: Body POSTed to alertWebhookUrl
+      required: [event, monitor, incidentId, cause, at]
+      properties:
+        event: { type: string, enum: [monitor.down, monitor.up] }
+        monitor:
+          type: object
+          properties:
+            id: { type: string, format: uuid }
+            name: { type: string }
+            url: { type: string }
+        incidentId: { type: string, format: uuid }
+        cause: { type: string, description: The incident's cause (also for monitor.up) }
+        at: { type: string, format: date-time }
+
+    StatusPage:
+      type: object
+      required: [name, slug, overall, monitors, generatedAt]
+      properties:
+        name: { type: string }
+        slug: { type: string }
+        overall: { type: string, enum: [operational, degraded] }
+        monitors:
+          type: array
+          description: Unpaused monitors, by name. URLs are not exposed.
+          items:
+            type: object
+            required: [name, status, uptimePercent, lastCheckedAt]
+            properties:
+              name: { type: string }
+              status: { type: string, enum: [pending, up, down] }
+              uptimePercent: { type: number, nullable: true }
+              lastCheckedAt: { type: string, format: date-time, nullable: true }
+        generatedAt: { type: string, format: date-time }
+
+    Problem:
+      type: object
+      required: [title, status, code]
+      properties:
+        type: { type: string, example: about:blank }
+        title: { type: string }
+        status: { type: integer }
+        code:
+          type: string
+          enum:
+            - VALIDATION_ERROR
+            - UNAUTHORIZED
+            - FORBIDDEN
+            - NOT_FOUND
+            - EMAIL_TAKEN
+            - INVALID_CREDENTIALS
+            - RATE_LIMITED
+        detail: { type: string }
