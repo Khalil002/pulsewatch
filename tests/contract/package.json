@@ -1,0 +1,12 @@
+{
+  "name": "pulsewatch-contract-tests",
+  "private": true,
+  "type": "module",
+  "description": "Black-box tests that every backend must pass against the same OpenAPI contract",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "vitest": "^2.1.8"
+  }
+}
