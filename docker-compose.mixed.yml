@@ -1,0 +1,25 @@
+# All three backends at once, behind the same "api" name, sharing Postgres and Redis:
+#   docker compose -f docker-compose.yml -f docker-compose.mixed.yml up --build
+# nginx balances requests across Spring, Express and ASP.NET, and the three schedulers split the
+# checks between them (FOR UPDATE SKIP LOCKED), which shows the contract really is shared.
+services:
+  api:
+    build: ./backends/spring
+    environment:
+      OTEL_SERVICE_NAME: pulsewatch-spring
+  api-express:
+    extends: { file: docker-compose.yml, service: api }
+    build: ./backends/express
+    environment:
+      OTEL_SERVICE_NAME: pulsewatch-express
+    networks:
+      default:
+        aliases: [api]
+  api-dotnet:
+    extends: { file: docker-compose.yml, service: api }
+    build: ./backends/dotnet
+    environment:
+      OTEL_SERVICE_NAME: pulsewatch-dotnet
+    networks:
+      default:
+        aliases: [api]
