@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    name: unit (${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [spring, express, dotnet]
+    steps:
+      - uses: actions/checkout@v4
+
+      - if: matrix.backend == 'spring'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - if: matrix.backend == 'spring'
+        working-directory: backends/spring
+        run: mvn -B verify
+
+      - if: matrix.backend == 'express'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: backends/express/package-lock.json
+      - if: matrix.backend == 'express'
+        working-directory: backends/express
+        run: |
+          npm ci
+          npm run typecheck
+          npm test
+
+      - if: matrix.backend == 'dotnet'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - if: matrix.backend == 'dotnet'
+        working-directory: backends/dotnet
+        run: dotnet test
+
+  # The same black-box suite runs against every backend on the real stack.
+  contract:
+    name: contract (${{ matrix.backend }})
+    needs: unit
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [spring, express, dotnet]
+    env:
+      BACKEND: ${{ matrix.backend }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # Three replicas, so the schedulers race for the same monitors and SKIP LOCKED is exercised.
+      # The observability services are left out to keep CI fast; tracing is switched off.
+      - name: Start the stack
+        env:
+          OTEL_EXPORTER_OTLP_ENDPOINT: ""
+        run: docker compose --profile testbed up -d --build --scale api=3 postgres redis migrate api web testbed
+
+      - name: Wait for the API
+        run: |
+          for i in $(seq 1 90); do
+            curl -sf http://localhost:8080/api/health && exit 0
+            sleep 2
+          done
+          exit 1
+
+      - name: Contract tests
+        working-directory: tests/contract
+        env:
+          API_URL: http://localhost:8080/api
+          TESTBED_URL: http://localhost:9000
+          TARGET_URL: http://testbed:9000
+        run: |
+          npm ci
+          npm test
+
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs --no-color api migrate web
+
+      - name: Tear down
+        if: always()
+        run: docker compose --profile testbed down -v
+
+  # Spring, Express and ASP.NET side by side behind one nginx, on one database: requests land on
+  # any of them and their schedulers share the work. The same suite must still pass.
+  mixed:
+    name: contract (all three at once)
+    needs: unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Start the stack
+        env:
+          OTEL_EXPORTER_OTLP_ENDPOINT: ""
+        run: >-
+          docker compose --profile testbed -f docker-compose.yml -f docker-compose.mixed.yml
+          up -d --build postgres redis migrate api api-express api-dotnet web testbed
+
+      - name: Wait for every backend
+        run: |
+          for i in $(seq 1 90); do
+            seen=$(for n in $(seq 1 12); do curl -sf http://localhost:8080/api/health; echo; done | grep -o '"backend":"[a-z]*"' | sort -u | wc -l)
+            [ "$seen" = "3" ] && exit 0
+            sleep 2
+          done
+          exit 1
+
+      - name: Contract tests
+        working-directory: tests/contract
+        run: |
+          npm ci
+          npm test
+
+      - name: Logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.yml -f docker-compose.mixed.yml logs --no-color api api-express api-dotnet migrate
+
+      - name: Tear down
+        if: always()
+        run: docker compose --profile testbed -f docker-compose.yml -f docker-compose.mixed.yml down -v
