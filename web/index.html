@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>pulsewatch</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="top">
+    <a class="brand" href="#" id="home-link">pulse<span>watch</span></a>
+    <div id="backend" class="pill">backend: …</div>
+    <div id="session" class="session"></div>
+  </header>
+
+  <main id="app">
+    <section id="auth-view" class="card narrow hidden">
+      <h2>Uptime monitoring you can host yourself</h2>
+      <p class="muted">Demo owner: <code>admin@pulsewatch.local</code> / <code>admin1234</code></p>
+      <form id="auth-form">
+        <input name="email" type="email" placeholder="email" required autocomplete="username" />
+        <input name="password" type="password" placeholder="password (8+ chars)" required minlength="8" autocomplete="current-password" />
+        <input name="orgName" placeholder="organisation name (to register)" maxlength="60" />
+        <div class="row">
+          <button type="submit" data-mode="login">Log in</button>
+          <button type="submit" data-mode="register" class="ghost">Create organisation</button>
+        </div>
+      </form>
+    </section>
+
+    <section id="dash-view" class="hidden">
+      <div class="summary" id="summary"></div>
+      <nav class="tabs" id="tabs">
+        <button data-tab="monitors" class="active">Monitors</button>
+        <button data-tab="incidents">Incidents</button>
+        <button data-tab="alerts">Alerts</button>
+        <button data-tab="settings">Settings</button>
+      </nav>
+
+      <div data-panel="monitors" class="panel">
+        <div class="layout">
+          <div>
+            <ul id="monitors" class="monitors"></ul>
+            <div id="detail" class="card hidden"></div>
+          </div>
+          <div class="card" id="new-monitor-card">
+            <h2>Add a monitor</h2>
+            <form id="monitor-form">
+              <input name="name" placeholder="name" required maxlength="100" />
+              <input name="url" type="url" placeholder="https://example.com/health" required />
+              <div class="row">
+                <label class="muted small">method <select name="method"><option>GET</option><option>HEAD</option></select></label>
+                <label class="muted small">every <input name="intervalSec" type="number" min="10" max="3600" value="60" class="num" />s</label>
+              </div>
+              <div class="row">
+                <label class="muted small">expect <input name="expectedStatus" type="number" min="100" max="599" value="200" class="num" /></label>
+                <label class="muted small">timeout <input name="timeoutMs" type="number" min="500" max="10000" value="5000" class="num" />ms</label>
+              </div>
+              <input name="alertWebhookUrl" type="url" placeholder="alert webhook URL (optional)" />
+              <button type="submit">Start monitoring</button>
+            </form>
+          </div>
+        </div>
+      </div>
+
+      <div data-panel="incidents" class="panel card hidden">
+        <h2>Incidents</h2>
+        <table class="table"><thead><tr><th>Monitor</th><th>Cause</th><th>Started</th><th>Duration</th></tr></thead>
+          <tbody id="incidents"></tbody></table>
+      </div>
+
+      <div data-panel="alerts" class="panel card hidden">
+        <h2>Alert deliveries <span class="muted small">signed with your webhook secret, retried with backoff</span></h2>
+        <table class="table"><thead><tr><th>Event</th><th>Monitor</th><th>Status</th><th>Attempts</th><th>Last error</th><th>Queued</th></tr></thead>
+          <tbody id="alerts"></tbody></table>
+      </div>
+
+      <div data-panel="settings" class="panel hidden">
+        <div class="grid2">
+          <div class="card">
+            <h2>API keys</h2>
+            <form id="key-form" class="row">
+              <input name="name" placeholder="key name, e.g. deploy bot" required maxlength="60" />
+              <button type="submit">Create key</button>
+            </form>
+            <div id="new-key" class="secret hidden"></div>
+            <ul id="keys" class="list"></ul>
+          </div>
+          <div class="card">
+            <h2>Members</h2>
+            <form id="member-form" class="row">
+              <input name="email" type="email" placeholder="email" required />
+              <input name="password" type="password" placeholder="password" required minlength="8" />
+              <select name="role"><option>viewer</option><option>admin</option></select>
+              <button type="submit">Add</button>
+            </form>
+            <ul id="members" class="list"></ul>
+            <h2 class="spaced">Webhook secret</h2>
+            <p class="muted small">Verify <code>X-Pulsewatch-Signature</code> as <code>sha256=HMAC_SHA256(secret, raw body)</code>.</p>
+            <code id="secret" class="secret-line"></code>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="status-view" class="hidden"></section>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="app.js"></script>
+</body>
+</html>
