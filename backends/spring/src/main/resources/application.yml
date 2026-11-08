@@ -1,0 +1,49 @@
+server:
+  port: ${PORT:8000}
+  shutdown: graceful
+
+spring:
+  application:
+    name: ${OTEL_SERVICE_NAME:pulsewatch-spring}
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:pulsewatch}
+    username: ${DB_USER:pulsewatch_app}
+    password: ${DB_PASSWORD:pulsewatch_app}
+    hikari:
+      maximum-pool-size: 20
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+  task:
+    scheduling:
+      pool:
+        # Scheduler, alert worker and retention each get a thread.
+        size: 3
+
+# Prometheus scrapes /metrics on each replica (nginx does not proxy it).
+management:
+  endpoints:
+    web:
+      base-path: /
+      exposure:
+        include: prometheus
+      path-mapping:
+        prometheus: metrics
+  tracing:
+    sampling:
+      probability: 1.0
+  metrics:
+    distribution:
+      slo:
+        pulsewatch.check.duration: 5ms,10ms,25ms,50ms,100ms,250ms,500ms,1s,2500ms,5s,10s
+
+app:
+  jwt-secret: ${JWT_SECRET:change-me-to-a-long-random-secret-of-32-bytes}
+  jwt-ttl-sec: ${JWT_TTL_SEC:43200}
+  rate-limit-max: ${RATE_LIMIT_MAX:60}
+  rate-limit-window-sec: ${RATE_LIMIT_WINDOW_SEC:60}
+  cache-ttl-sec: ${CACHE_TTL_SEC:5}
+  retention-days: ${RETENTION_DAYS:30}
+  scheduler-tick-ms: ${SCHEDULER_TICK_MS:1000}
+  max-in-flight-checks: ${MAX_INFLIGHT_CHECKS:50}
