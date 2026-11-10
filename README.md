@@ -6,6 +6,20 @@ The same API is implemented three times, in **Spring Boot**, **Node.js/Express**
 
 ![CI](https://github.com/Khalil002/pulsewatch/actions/workflows/ci.yml/badge.svg)
 
+## Contents
+
+- [Introduction](#introduction)
+- [Interface](#interface)
+- [Architecture](#architecture)
+- [Modular backend](#modular-backend)
+- [Usage](#usage)
+  - [Quick start](#quick-start)
+  - [Self-hosting guide](#self-hosting-guide)
+  - [Configuration](#configuration)
+  - [Running a backend from source](#running-a-backend-from-source)
+- [Testing](#testing)
+- [Project layout](#project-layout)
+
 ## Introduction
 
 An uptime monitor looks simple from the outside, but it's mostly background work that has to be correct when several copies of it run at once. pulsewatch covers the whole loop:
